@@ -186,6 +186,7 @@ import org.apache.pulsar.common.policies.data.stats.SubscriptionStatsImpl;
 import org.apache.pulsar.common.policies.data.stats.TopicMetricBean;
 import org.apache.pulsar.common.policies.data.stats.TopicStatsImpl;
 import org.apache.pulsar.common.protocol.Commands;
+import org.apache.pulsar.common.protocol.Commands.ChecksumType;
 import org.apache.pulsar.common.protocol.Markers;
 import org.apache.pulsar.common.protocol.schema.SchemaData;
 import org.apache.pulsar.common.protocol.schema.SchemaStorage;
@@ -655,7 +656,8 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
                 messageDeduplication.isDuplicate(publishContext, headersAndPayload);
         switch (status) {
             case NotDup:
-                asyncAddEntry(headersAndPayload, publishContext);
+                ByteBuf finalPayload = correctDeliverAtTimeForClockSkew(headersAndPayload);
+                asyncAddEntry(finalPayload, publishContext);
                 break;
             case Dup:
                 // Immediately acknowledge duplicated message
@@ -4818,6 +4820,57 @@ public class PersistentTopic extends AbstractTopic implements Topic, AddEntryCal
 
     public Optional<TopicName> getShadowSourceTopic() {
         return Optional.ofNullable(shadowSourceTopic);
+    }
+
+    /**
+     * Correct deliverAtTime for clock skew between client and broker at publish time.
+     *
+     * <p>Since publishTime and deliverAtTime are both set by the client, their difference
+     * (relativeDelay) represents the intended delay regardless of clock skew. By recomputing
+     * deliverAtTime as brokerNow + relativeDelay at publish time, the persisted value uses
+     * the broker's clock, so dispatch-time logic works correctly even with backlog.
+     *
+     * @return the original ByteBuf if no correction is needed, or a new ByteBuf with corrected
+     *         metadata (the original ByteBuf is released in that case).
+     */
+    protected ByteBuf correctDeliverAtTimeForClockSkew(ByteBuf headersAndPayload) {
+        if (!isDelayedDeliveryEnabled()) {
+            return headersAndPayload;
+        }
+
+        headersAndPayload.markReaderIndex();
+        MessageMetadata msgMetadata = Commands.parseMessageMetadata(headersAndPayload);
+
+        if (!msgMetadata.hasDeliverAtTime() || !msgMetadata.hasPublishTime()) {
+            headersAndPayload.resetReaderIndex();
+            return headersAndPayload;
+        }
+
+        long clientDeliverAt = msgMetadata.getDeliverAtTime();
+        long clientPublishTime = msgMetadata.getPublishTime();
+        long relativeDelay = clientDeliverAt - clientPublishTime;
+
+        if (relativeDelay <= 0) {
+            headersAndPayload.resetReaderIndex();
+            return headersAndPayload;
+        }
+
+        long brokerNow = System.currentTimeMillis();
+        long correctedDeliverAt = brokerNow + relativeDelay;
+
+        // After parseMessageMetadata, reader index points to start of payload
+        ByteBuf payload = headersAndPayload.retainedSlice(
+                headersAndPayload.readerIndex(), headersAndPayload.readableBytes());
+
+        // Copy metadata and set corrected deliverAtTime
+        MessageMetadata correctedMetadata = new MessageMetadata().copyFrom(msgMetadata);
+        correctedMetadata.setDeliverAtTime(correctedDeliverAt);
+
+        ByteBuf corrected = Commands.serializeMetadataAndPayload(ChecksumType.Crc32c, correctedMetadata, payload);
+        payload.release();
+        headersAndPayload.release();
+
+        return corrected;
     }
 
     protected boolean isExceedMaximumDeliveryDelay(ByteBuf headersAndPayload) {

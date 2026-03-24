@@ -18,27 +18,17 @@
  */
 package org.apache.pulsar.broker.service.persistent;
 
-import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
+import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
-import java.util.Collections;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import org.apache.bookkeeper.common.util.OrderedExecutor;
-import org.apache.bookkeeper.mledger.impl.ManagedCursorImpl;
-import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
-import org.apache.pulsar.broker.PulsarService;
-import org.apache.pulsar.broker.ServiceConfiguration;
-import org.apache.pulsar.broker.delayed.DelayedDeliveryTracker;
-import org.apache.pulsar.broker.delayed.DelayedDeliveryTrackerFactory;
-import org.apache.pulsar.broker.service.BrokerService;
-import org.apache.pulsar.broker.service.plugin.EntryFilterProvider;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import org.apache.pulsar.common.api.proto.MessageMetadata;
-import org.apache.pulsar.common.policies.data.HierarchyTopicPolicies;
-import org.mockito.ArgumentCaptor;
+import org.apache.pulsar.common.protocol.Commands;
+import org.apache.pulsar.common.protocol.Commands.ChecksumType;
+import org.mockito.ArgumentMatchers;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
@@ -46,270 +36,286 @@ import org.testng.annotations.Test;
 public class TrackDelayedDeliveryClockSkewTest {
 
     private PersistentTopic topicMock;
-    private ManagedCursorImpl cursorMock;
-    private PersistentSubscription subscriptionMock;
-    private DelayedDeliveryTracker trackerMock;
-    private DelayedDeliveryTrackerFactory trackerFactoryMock;
 
     @BeforeMethod
-    public void setup() throws Exception {
-        ServiceConfiguration configMock = mock(ServiceConfiguration.class);
-        doReturn(true).when(configMock).isSubscriptionRedeliveryTrackerEnabled();
-        doReturn(100).when(configMock).getDispatcherMaxReadBatchSize();
-        doReturn(false).when(configMock).isDispatcherDispatchMessagesInSubscriptionThread();
-        doReturn(false).when(configMock).isAllowOverrideEntryFilters();
-        doReturn(10).when(configMock).getDispatcherRetryBackoffInitialTimeInMs();
-        doReturn(50).when(configMock).getDispatcherRetryBackoffMaxTimeInMs();
-
-        PulsarService pulsarMock = mock(PulsarService.class);
-        doReturn(configMock).when(pulsarMock).getConfiguration();
-
-        BrokerService brokerMock = mock(BrokerService.class);
-        doReturn(pulsarMock).when(brokerMock).pulsar();
-
-        EntryFilterProvider entryFilterProvider = mock(EntryFilterProvider.class);
-        doReturn(Collections.emptyList()).when(entryFilterProvider).getBrokerEntryFilters();
-        doReturn(entryFilterProvider).when(brokerMock).getEntryFilterProvider();
-
-        OrderedExecutor orderedExecutor = mock(OrderedExecutor.class);
-        ExecutorService executorService = Executors.newSingleThreadExecutor();
-        doReturn(executorService).when(orderedExecutor).chooseThread();
-        doReturn(orderedExecutor).when(brokerMock).getTopicOrderedExecutor();
-
-        trackerMock = mock(DelayedDeliveryTracker.class);
-        when(trackerMock.addMessage(anyLong(), anyLong(), anyLong())).thenReturn(true);
-
-        trackerFactoryMock = mock(DelayedDeliveryTrackerFactory.class);
-        when(trackerFactoryMock.newTracker(org.mockito.ArgumentMatchers.any())).thenReturn(trackerMock);
-        doReturn(trackerFactoryMock).when(brokerMock).getDelayedDeliveryTrackerFactory();
-
-        HierarchyTopicPolicies topicPolicies = new HierarchyTopicPolicies();
-        topicPolicies.getMaxConsumersPerSubscription().updateBrokerValue(0);
-
+    public void setup() {
         topicMock = mock(PersistentTopic.class);
-        doReturn(brokerMock).when(topicMock).getBrokerService();
-        doReturn("persistent://public/default/testTopic").when(topicMock).getName();
-        doReturn(topicPolicies).when(topicMock).getHierarchyTopicPolicies();
         doReturn(true).when(topicMock).isDelayedDeliveryEnabled();
-        doReturn(1000L).when(topicMock).getDelayedDeliveryTickTimeMillis();
+        doCallRealMethod().when(topicMock).correctDeliverAtTimeForClockSkew(ArgumentMatchers.any(ByteBuf.class));
+    }
 
-        ManagedLedgerImpl ledgerMock = mock(ManagedLedgerImpl.class);
-        cursorMock = mock(ManagedCursorImpl.class);
-        doReturn("testSubscription").when(cursorMock).getName();
-        doReturn(ledgerMock).when(cursorMock).getManagedLedger();
+    private ByteBuf createMessageBuf(MessageMetadata metadata) {
+        ByteBuf payload = Unpooled.wrappedBuffer("test-payload".getBytes());
+        return Commands.serializeMetadataAndPayload(ChecksumType.Crc32c, metadata, payload);
+    }
 
-        subscriptionMock = mock(PersistentSubscription.class);
-        when(subscriptionMock.getTopic()).thenReturn(topicMock);
+    private MessageMetadata parseMetadata(ByteBuf buf) {
+        buf.markReaderIndex();
+        MessageMetadata md = new MessageMetadata();
+        Commands.parseMessageMetadata(buf, md);
+        buf.resetReaderIndex();
+        return md;
     }
 
     /**
-     * Simulate client clock is 5 minutes behind server.
-     * Client uses deliverAfter(3min), so:
-     *   publishTime = clientNow (serverNow - 5min)
-     *   deliverAtTime = clientNow + 3min (serverNow - 2min)
-     *   relativeDelay = 3min
+     * Client clock is 5 minutes behind broker.
+     * Client uses deliverAfter(3min):
+     *   publishTime = clientNow = brokerNow - 5min
+     *   deliverAtTime = clientNow + 3min = brokerNow - 2min
      *
-     * Without fix: broker uses deliverAtTime directly (serverNow - 2min), already passed, delivers immediately.
-     * With fix: broker recalculates as serverNow + 3min.
+     * Without fix: broker persists deliverAtTime = brokerNow - 2min, already past -> delivers immediately.
+     * With fix: broker corrects to brokerNow + 3min at publish time.
      */
     @Test
-    public void testDeliverAfterWithClientClockBehindServer() {
-        PersistentDispatcherMultipleConsumers dispatcher =
-                new PersistentDispatcherMultipleConsumers(topicMock, cursorMock, subscriptionMock);
-
-        long serverNow = System.currentTimeMillis();
-        long clockSkew = 5 * 60 * 1000L; // client is 5 minutes behind
-        long clientNow = serverNow - clockSkew;
-        long delayMs = 3 * 60 * 1000L; // 3 minutes delay
-
-        MessageMetadata msgMetadata = new MessageMetadata();
-        msgMetadata.setPublishTime(clientNow);
-        msgMetadata.setDeliverAtTime(clientNow + delayMs);
-
-        dispatcher.trackDelayedDelivery(1, 1, msgMetadata);
-
-        ArgumentCaptor<Long> deliverAtCaptor = ArgumentCaptor.forClass(Long.class);
-        verify(trackerMock).addMessage(anyLong(), anyLong(), deliverAtCaptor.capture());
-
-        long capturedDeliverAt = deliverAtCaptor.getValue();
-        // The recalculated time should be approximately serverNow + 3min
-        // Allow 1 second tolerance for test execution time
-        long expectedMin = serverNow + delayMs - 1000;
-        long expectedMax = serverNow + delayMs + 1000;
-        assertTrue(capturedDeliverAt >= expectedMin && capturedDeliverAt <= expectedMax,
-                String.format("Expected deliverAtTime around %d, but got %d (diff: %d ms)",
-                        serverNow + delayMs, capturedDeliverAt, capturedDeliverAt - (serverNow + delayMs)));
-    }
-
-    /**
-     * Simulate client clock is 5 minutes ahead of server.
-     * Client uses deliverAfter(3min), so:
-     *   publishTime = clientNow (serverNow + 5min)
-     *   deliverAtTime = clientNow + 3min (serverNow + 8min)
-     *   relativeDelay = 3min
-     *
-     * Without fix: broker uses deliverAtTime directly (serverNow + 8min), delivers 5 minutes too late.
-     * With fix: broker recalculates as serverNow + 3min.
-     */
-    @Test
-    public void testDeliverAfterWithClientClockAheadOfServer() {
-        PersistentDispatcherMultipleConsumers dispatcher =
-                new PersistentDispatcherMultipleConsumers(topicMock, cursorMock, subscriptionMock);
-
-        long serverNow = System.currentTimeMillis();
-        long clockSkew = 5 * 60 * 1000L; // client is 5 minutes ahead
-        long clientNow = serverNow + clockSkew;
+    public void testClientClockBehindServer() {
+        long brokerNow = System.currentTimeMillis();
+        long clockSkew = 5 * 60 * 1000L;
+        long clientNow = brokerNow - clockSkew;
         long delayMs = 3 * 60 * 1000L;
 
-        MessageMetadata msgMetadata = new MessageMetadata();
-        msgMetadata.setPublishTime(clientNow);
-        msgMetadata.setDeliverAtTime(clientNow + delayMs);
+        MessageMetadata metadata = new MessageMetadata();
+        metadata.setProducerName("test");
+        metadata.setSequenceId(1);
+        metadata.setPublishTime(clientNow);
+        metadata.setDeliverAtTime(clientNow + delayMs);
 
-        dispatcher.trackDelayedDelivery(1, 1, msgMetadata);
+        ByteBuf original = createMessageBuf(metadata);
+        ByteBuf corrected = topicMock.correctDeliverAtTimeForClockSkew(original);
 
-        ArgumentCaptor<Long> deliverAtCaptor = ArgumentCaptor.forClass(Long.class);
-        verify(trackerMock).addMessage(anyLong(), anyLong(), deliverAtCaptor.capture());
+        MessageMetadata correctedMd = parseMetadata(corrected);
+        long correctedDeliverAt = correctedMd.getDeliverAtTime();
 
-        long capturedDeliverAt = deliverAtCaptor.getValue();
-        long expectedMin = serverNow + delayMs - 1000;
-        long expectedMax = serverNow + delayMs + 1000;
-        assertTrue(capturedDeliverAt >= expectedMin && capturedDeliverAt <= expectedMax,
-                String.format("Expected deliverAtTime around %d, but got %d (diff: %d ms)",
-                        serverNow + delayMs, capturedDeliverAt, capturedDeliverAt - (serverNow + delayMs)));
+        // Should be approximately brokerNow + 3min
+        assertTrue(Math.abs(correctedDeliverAt - (brokerNow + delayMs)) < 1000,
+                String.format("Expected ~%d, got %d (diff: %d ms)",
+                        brokerNow + delayMs, correctedDeliverAt,
+                        correctedDeliverAt - (brokerNow + delayMs)));
+
+        corrected.release();
     }
 
     /**
-     * When publishTime is not present in metadata, fall back to using the original deliverAtTime.
+     * Client clock is 5 minutes ahead of broker.
+     * Client uses deliverAfter(3min):
+     *   publishTime = clientNow = brokerNow + 5min
+     *   deliverAtTime = clientNow + 3min = brokerNow + 8min
+     *
+     * Without fix: broker persists deliverAtTime = brokerNow + 8min, delivers 5 minutes too late.
+     * With fix: broker corrects to brokerNow + 3min at publish time.
      */
     @Test
-    public void testFallbackWhenNoPublishTime() {
-        PersistentDispatcherMultipleConsumers dispatcher =
-                new PersistentDispatcherMultipleConsumers(topicMock, cursorMock, subscriptionMock);
+    public void testClientClockAheadOfServer() {
+        long brokerNow = System.currentTimeMillis();
+        long clockSkew = 5 * 60 * 1000L;
+        long clientNow = brokerNow + clockSkew;
+        long delayMs = 3 * 60 * 1000L;
 
-        long deliverAt = System.currentTimeMillis() + 60_000;
+        MessageMetadata metadata = new MessageMetadata();
+        metadata.setProducerName("test");
+        metadata.setSequenceId(1);
+        metadata.setPublishTime(clientNow);
+        metadata.setDeliverAtTime(clientNow + delayMs);
 
-        MessageMetadata msgMetadata = new MessageMetadata();
-        // No publishTime set
-        msgMetadata.setDeliverAtTime(deliverAt);
+        ByteBuf original = createMessageBuf(metadata);
+        ByteBuf corrected = topicMock.correctDeliverAtTimeForClockSkew(original);
 
-        dispatcher.trackDelayedDelivery(1, 1, msgMetadata);
+        MessageMetadata correctedMd = parseMetadata(corrected);
+        long correctedDeliverAt = correctedMd.getDeliverAtTime();
 
-        ArgumentCaptor<Long> deliverAtCaptor = ArgumentCaptor.forClass(Long.class);
-        verify(trackerMock).addMessage(anyLong(), anyLong(), deliverAtCaptor.capture());
+        assertTrue(Math.abs(correctedDeliverAt - (brokerNow + delayMs)) < 1000,
+                String.format("Expected ~%d, got %d (diff: %d ms)",
+                        brokerNow + delayMs, correctedDeliverAt,
+                        correctedDeliverAt - (brokerNow + delayMs)));
 
-        // Should use original deliverAtTime as-is
-        assertTrue(deliverAtCaptor.getValue() == deliverAt,
-                "When publishTime is missing, should use original deliverAtTime");
+        corrected.release();
     }
 
     /**
-     * When relativeDelay <= 0 (deliverAtTime <= publishTime, abnormal data),
-     * fall back to using the original deliverAtTime.
-     */
-    @Test
-    public void testFallbackWhenRelativeDelayNegative() {
-        PersistentDispatcherMultipleConsumers dispatcher =
-                new PersistentDispatcherMultipleConsumers(topicMock, cursorMock, subscriptionMock);
-
-        long now = System.currentTimeMillis();
-
-        MessageMetadata msgMetadata = new MessageMetadata();
-        msgMetadata.setPublishTime(now);
-        msgMetadata.setDeliverAtTime(now - 1000); // deliverAtTime before publishTime
-
-        dispatcher.trackDelayedDelivery(1, 1, msgMetadata);
-
-        ArgumentCaptor<Long> deliverAtCaptor = ArgumentCaptor.forClass(Long.class);
-        verify(trackerMock).addMessage(anyLong(), anyLong(), deliverAtCaptor.capture());
-
-        assertTrue(deliverAtCaptor.getValue() == now - 1000,
-                "When relativeDelay <= 0, should use original deliverAtTime");
-    }
-
-    /**
-     * When no deliverAtTime is set (normal non-delayed message), deliverAtTime should be -1.
-     */
-    @Test
-    public void testNoDeliverAtTime() {
-        PersistentDispatcherMultipleConsumers dispatcher =
-                new PersistentDispatcherMultipleConsumers(topicMock, cursorMock, subscriptionMock);
-
-        // First call with a delayed message to initialize the tracker
-        MessageMetadata initMsg = new MessageMetadata();
-        initMsg.setPublishTime(System.currentTimeMillis());
-        initMsg.setDeliverAtTime(System.currentTimeMillis() + 60_000);
-        dispatcher.trackDelayedDelivery(1, 1, initMsg);
-
-        // Now call with a normal message (no deliverAtTime)
-        MessageMetadata msgMetadata = new MessageMetadata();
-        msgMetadata.setPublishTime(System.currentTimeMillis());
-        // No deliverAtTime set
-
-        dispatcher.trackDelayedDelivery(1, 2, msgMetadata);
-
-        ArgumentCaptor<Long> deliverAtCaptor = ArgumentCaptor.forClass(Long.class);
-        verify(trackerMock, org.mockito.Mockito.times(2)).addMessage(anyLong(), anyLong(), deliverAtCaptor.capture());
-
-        // The second call should pass -1
-        long secondDeliverAt = deliverAtCaptor.getAllValues().get(1);
-        assertTrue(secondDeliverAt == -1L,
-                "When no deliverAtTime is set, should pass -1");
-    }
-
-    /**
-     * Test with synchronized clocks (no skew) - deliverAfter should work the same.
+     * No clock skew: corrected value should match the original.
      */
     @Test
     public void testNoClockSkew() {
-        PersistentDispatcherMultipleConsumers dispatcher =
-                new PersistentDispatcherMultipleConsumers(topicMock, cursorMock, subscriptionMock);
-
-        long serverNow = System.currentTimeMillis();
+        long brokerNow = System.currentTimeMillis();
         long delayMs = 60_000;
 
-        MessageMetadata msgMetadata = new MessageMetadata();
-        msgMetadata.setPublishTime(serverNow); // client clock matches server
-        msgMetadata.setDeliverAtTime(serverNow + delayMs);
+        MessageMetadata metadata = new MessageMetadata();
+        metadata.setProducerName("test");
+        metadata.setSequenceId(1);
+        metadata.setPublishTime(brokerNow);
+        metadata.setDeliverAtTime(brokerNow + delayMs);
 
-        dispatcher.trackDelayedDelivery(1, 1, msgMetadata);
+        ByteBuf original = createMessageBuf(metadata);
+        ByteBuf corrected = topicMock.correctDeliverAtTimeForClockSkew(original);
 
-        ArgumentCaptor<Long> deliverAtCaptor = ArgumentCaptor.forClass(Long.class);
-        verify(trackerMock).addMessage(anyLong(), anyLong(), deliverAtCaptor.capture());
+        MessageMetadata correctedMd = parseMetadata(corrected);
+        long correctedDeliverAt = correctedMd.getDeliverAtTime();
 
-        long capturedDeliverAt = deliverAtCaptor.getValue();
-        long expectedMin = serverNow + delayMs - 1000;
-        long expectedMax = serverNow + delayMs + 1000;
-        assertTrue(capturedDeliverAt >= expectedMin && capturedDeliverAt <= expectedMax,
-                "With no clock skew, recalculated time should match original");
+        assertTrue(Math.abs(correctedDeliverAt - (brokerNow + delayMs)) < 1000,
+                "With no clock skew, corrected time should match original");
+
+        corrected.release();
     }
 
     /**
-     * Test the Classic dispatcher variant has the same behavior.
+     * No deliverAtTime but publishTime is set: should return ByteBuf unchanged.
+     * (publishTime is a required field in MessageMetadata, so it's always present.)
+     */
+
+    /**
+     * No deliverAtTime: should return ByteBuf unchanged.
      */
     @Test
-    public void testClassicDispatcherClockSkewRecalculation() {
-        PersistentDispatcherMultipleConsumersClassic dispatcher =
-                new PersistentDispatcherMultipleConsumersClassic(topicMock, cursorMock, subscriptionMock);
+    public void testNoDeliverAtTime() {
+        MessageMetadata metadata = new MessageMetadata();
+        metadata.setProducerName("test");
+        metadata.setSequenceId(1);
+        metadata.setPublishTime(System.currentTimeMillis());
+        // No deliverAtTime set
 
-        long serverNow = System.currentTimeMillis();
+        ByteBuf original = createMessageBuf(metadata);
+        ByteBuf result = topicMock.correctDeliverAtTimeForClockSkew(original);
+
+        assertTrue(result == original, "Should return same ByteBuf when deliverAtTime is missing");
+
+        result.release();
+    }
+
+    /**
+     * relativeDelay <= 0 (deliverAtTime <= publishTime): should return ByteBuf unchanged.
+     */
+    @Test
+    public void testNegativeRelativeDelay() {
+        long now = System.currentTimeMillis();
+
+        MessageMetadata metadata = new MessageMetadata();
+        metadata.setProducerName("test");
+        metadata.setSequenceId(1);
+        metadata.setPublishTime(now);
+        metadata.setDeliverAtTime(now - 1000); // deliverAtTime before publishTime
+
+        ByteBuf original = createMessageBuf(metadata);
+        ByteBuf result = topicMock.correctDeliverAtTimeForClockSkew(original);
+
+        assertTrue(result == original, "Should return same ByteBuf when relativeDelay <= 0");
+
+        MessageMetadata resultMd = parseMetadata(result);
+        assertEquals(resultMd.getDeliverAtTime(), now - 1000);
+
+        result.release();
+    }
+
+    /**
+     * Delayed delivery is disabled: should return ByteBuf unchanged.
+     */
+    @Test
+    public void testDelayedDeliveryDisabled() {
+        doReturn(false).when(topicMock).isDelayedDeliveryEnabled();
+
+        long brokerNow = System.currentTimeMillis();
         long clockSkew = 5 * 60 * 1000L;
-        long clientNow = serverNow - clockSkew;
+        long clientNow = brokerNow - clockSkew;
+
+        MessageMetadata metadata = new MessageMetadata();
+        metadata.setProducerName("test");
+        metadata.setSequenceId(1);
+        metadata.setPublishTime(clientNow);
+        metadata.setDeliverAtTime(clientNow + 60_000);
+
+        ByteBuf original = createMessageBuf(metadata);
+        ByteBuf result = topicMock.correctDeliverAtTimeForClockSkew(original);
+
+        assertTrue(result == original, "Should return same ByteBuf when delayed delivery is disabled");
+
+        result.release();
+    }
+
+    /**
+     * Verify that non-deliverAtTime fields in metadata are preserved after correction.
+     */
+    @Test
+    public void testMetadataFieldsPreserved() {
+        long brokerNow = System.currentTimeMillis();
+        long clockSkew = 5 * 60 * 1000L;
+        long clientNow = brokerNow - clockSkew;
         long delayMs = 3 * 60 * 1000L;
 
-        MessageMetadata msgMetadata = new MessageMetadata();
-        msgMetadata.setPublishTime(clientNow);
-        msgMetadata.setDeliverAtTime(clientNow + delayMs);
+        MessageMetadata metadata = new MessageMetadata();
+        metadata.setProducerName("test-producer");
+        metadata.setSequenceId(42);
+        metadata.setPublishTime(clientNow);
+        metadata.setDeliverAtTime(clientNow + delayMs);
 
-        dispatcher.trackDelayedDelivery(1, 1, msgMetadata);
+        ByteBuf original = createMessageBuf(metadata);
+        ByteBuf corrected = topicMock.correctDeliverAtTimeForClockSkew(original);
 
-        ArgumentCaptor<Long> deliverAtCaptor = ArgumentCaptor.forClass(Long.class);
-        verify(trackerMock).addMessage(anyLong(), anyLong(), deliverAtCaptor.capture());
+        MessageMetadata correctedMd = parseMetadata(corrected);
 
-        long capturedDeliverAt = deliverAtCaptor.getValue();
-        long expectedMin = serverNow + delayMs - 1000;
-        long expectedMax = serverNow + delayMs + 1000;
-        assertTrue(capturedDeliverAt >= expectedMin && capturedDeliverAt <= expectedMax,
-                String.format("Classic dispatcher: expected deliverAtTime around %d, but got %d",
-                        serverNow + delayMs, capturedDeliverAt));
+        // Verify other fields are preserved
+        assertEquals(correctedMd.getProducerName(), "test-producer");
+        assertEquals(correctedMd.getSequenceId(), 42);
+        assertEquals(correctedMd.getPublishTime(), clientNow);
+
+        corrected.release();
+    }
+
+    /**
+     * Demonstrate that publish-time correction is immune to backlog.
+     *
+     * Scenario: client clock is 5 minutes behind, deliverAfter(3min).
+     * The message is corrected at publish time to deliverAt = brokerPublishTime + 3min.
+     * Then it sits in backlog for 2 minutes before the dispatcher reads it.
+     *
+     * publish-time approach:
+     *   deliverAt was already corrected and persisted as brokerPublishTime + 3min at publish time.
+     *   At dispatch time (2 min later), the remaining delay is only 1 min, which is correct.
+     */
+    @Test
+    public void testBacklogDoesNotInflateDelay() {
+        long brokerPublishTime = System.currentTimeMillis();
+        long clockSkew = 5 * 60 * 1000L;
+        long clientNow = brokerPublishTime - clockSkew;
+        long delayMs = 3 * 60 * 1000L;
+        long backlogDuration = 2 * 60 * 1000L;
+
+        // Step 1: at publish time, broker corrects deliverAtTime
+        MessageMetadata metadata = new MessageMetadata();
+        metadata.setProducerName("test");
+        metadata.setSequenceId(1);
+        metadata.setPublishTime(clientNow);
+        metadata.setDeliverAtTime(clientNow + delayMs);
+
+        ByteBuf original = createMessageBuf(metadata);
+        ByteBuf corrected = topicMock.correctDeliverAtTimeForClockSkew(original);
+
+        MessageMetadata correctedMd = parseMetadata(corrected);
+        long persistedDeliverAt = correctedMd.getDeliverAtTime();
+
+        // The persisted deliverAtTime should be ~ brokerPublishTime + 3min
+        long expectedDeliverAt = brokerPublishTime + delayMs;
+        assertTrue(Math.abs(persistedDeliverAt - expectedDeliverAt) < 1000,
+                String.format("Persisted deliverAt should be ~%d, got %d", expectedDeliverAt, persistedDeliverAt));
+
+        // Step 2: simulate backlog — dispatcher reads entry 2 minutes later
+        long dispatchTime = brokerPublishTime + backlogDuration;
+
+        // The remaining delay at dispatch time should be ~ 1 minute, NOT 3 minutes
+        long remainingDelay = persistedDeliverAt - dispatchTime;
+        long expectedRemaining = delayMs - backlogDuration; // 3min - 2min = 1min
+
+        assertTrue(Math.abs(remainingDelay - expectedRemaining) < 1000,
+                String.format("Remaining delay at dispatch should be ~%d ms (1 min), got %d ms. "
+                        + "If this were ~%d ms (3 min), the old dispatch-time bug is present.",
+                        expectedRemaining, remainingDelay, delayMs));
+
+        // Step 3: contrast with the old buggy dispatch-time approach
+        long buggyDeliverAt = dispatchTime + delayMs;
+        long buggyRemaining = buggyDeliverAt - dispatchTime; // always = delayMs = 3min
+
+        assertEquals(buggyRemaining, delayMs,
+                "Buggy approach always restarts full delay regardless of backlog");
+        assertTrue(buggyDeliverAt - persistedDeliverAt >= backlogDuration - 1000,
+                String.format("Buggy approach over-delays by ~backlog duration (%d ms)", backlogDuration));
+
+        corrected.release();
     }
 }
