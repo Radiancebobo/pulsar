@@ -44,7 +44,18 @@ public class RetryUtil {
     private static <T> void executeWithRetry(Supplier<CompletableFuture<T>> supplier, Backoff backoff,
                                              ScheduledExecutorService scheduledExecutorService,
                                              CompletableFuture<T> callback) {
-        supplier.get().whenComplete((result, e) -> {
+        CompletableFuture<T> future;
+        try {
+            future = supplier.get();
+        } catch (Throwable e) {
+            future = new CompletableFuture<>();
+            future.completeExceptionally(e);
+        }
+        if (future == null) {
+            future = new CompletableFuture<>();
+            future.completeExceptionally(new NullPointerException("Retry supplier returned null future"));
+        }
+        future.whenComplete((result, e) -> {
             if (e != null) {
                 long next = backoff.next().toMillis();
                 boolean isMandatoryStop = backoff.isMandatoryStopMade();

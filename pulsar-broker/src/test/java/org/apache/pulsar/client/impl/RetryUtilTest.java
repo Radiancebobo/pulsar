@@ -24,6 +24,7 @@ import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import lombok.Cleanup;
 import org.apache.pulsar.client.util.RetryUtil;
@@ -58,6 +59,28 @@ public class RetryUtilTest {
         }, backoff, executor, callback);
         assertTrue(callback.get());
         assertEquals(atomicInteger.get(), 5);
+    }
+
+    @Test
+    public void testSyncFailureIsRetried() throws Exception {
+        @Cleanup("shutdownNow")
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        CompletableFuture<Boolean> callback = new CompletableFuture<>();
+        AtomicInteger atomicInteger = new AtomicInteger(0);
+        Backoff backoff = Backoff.builder()
+                .initialDelay(Duration.ofMillis(10))
+                .maxBackoff(Duration.ofMillis(10))
+                .mandatoryStop(Duration.ofMillis(1000))
+                .jitterPercent(0)
+                .build();
+        RetryUtil.retryAsynchronously(() -> {
+            if (atomicInteger.incrementAndGet() == 1) {
+                throw new RuntimeException("sync fail");
+            }
+            return CompletableFuture.completedFuture(true);
+        }, backoff, executor, callback);
+        assertTrue(callback.get(2, TimeUnit.SECONDS));
+        assertEquals(atomicInteger.get(), 2);
     }
 
     @Test
