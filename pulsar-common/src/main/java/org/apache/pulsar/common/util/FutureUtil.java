@@ -200,8 +200,7 @@ public class FutureUtil {
         return future;
     }
 
-    private static <T> CompletableFuture<T> getFutureSafely(Supplier<CompletableFuture<T>> supplier,
-                                                            String nullFutureMessage) {
+    public static <T> CompletableFuture<T> supplySafely(Supplier<CompletableFuture<T>> supplier) {
         CompletableFuture<T> future;
         try {
             future = supplier.get();
