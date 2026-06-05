@@ -200,6 +200,20 @@ public class FutureUtil {
         return future;
     }
 
+    private static <T> CompletableFuture<T> getFutureSafely(Supplier<CompletableFuture<T>> supplier,
+                                                            String nullFutureMessage) {
+        CompletableFuture<T> future;
+        try {
+            future = supplier.get();
+        } catch (Throwable t) {
+            return failedFuture(t);
+        }
+        if (future == null) {
+            return failedFuture(new NullPointerException(nullFutureMessage));
+        }
+        return future;
+    }
+
     public static Throwable unwrapCompletionException(Throwable ex) {
         if (ex instanceof CompletionException) {
             return unwrapCompletionException(ex.getCause());
@@ -238,11 +252,13 @@ public class FutureUtil {
                 if (sequencerFuture.isCompletedExceptionally() && allowExceptionBreakChain) {
                     return sequencerFuture;
                 }
-                return sequencerFuture = newTask.get();
+                return sequencerFuture = getFutureSafely(newTask, "Expected Supplier should not return null");
             }
             return sequencerFuture = allowExceptionBreakChain
-                    ? sequencerFuture.thenCompose(__ -> newTask.get())
-                    : sequencerFuture.exceptionally(ex -> null).thenCompose(__ -> newTask.get());
+                    ? sequencerFuture.thenCompose(__ -> getFutureSafely(newTask,
+                            "Expected Supplier should not return null"))
+                    : sequencerFuture.exceptionally(ex -> null).thenCompose(__ -> getFutureSafely(newTask,
+                            "Expected Supplier should not return null"));
         }
     }
 
@@ -298,13 +314,17 @@ public class FutureUtil {
         }
         final CompletableFuture<T> future = new CompletableFuture<>();
         try {
-            executor.execute(() -> futureSupplier.get().whenComplete((result, error) -> {
-                if (error != null) {
-                    future.completeExceptionally(error);
-                    return;
-                }
-                future.complete(result);
-            }));
+            executor.execute(() -> {
+                CompletableFuture<T> supplierFuture =
+                        getFutureSafely(futureSupplier, "Expected Supplier should not return null");
+                supplierFuture.whenComplete((result, error) -> {
+                    if (error != null) {
+                        future.completeExceptionally(error);
+                        return;
+                    }
+                    future.complete(result);
+                });
+            });
         } catch (RejectedExecutionException ex) {
             future.completeExceptionally(ex);
         }
