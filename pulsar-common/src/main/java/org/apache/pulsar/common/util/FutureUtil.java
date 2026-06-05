@@ -208,7 +208,7 @@ public class FutureUtil {
             return failedFuture(t);
         }
         if (future == null) {
-            return failedFuture(new NullPointerException(nullFutureMessage));
+            return failedFuture(new NullPointerException("The given supplier returned null, supplier=" + supplier));
         }
         return future;
     }
