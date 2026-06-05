@@ -200,6 +200,17 @@ public class FutureUtil {
         return future;
     }
 
+    /**
+     * Invokes a supplier that is expected to return a {@link CompletableFuture}, converting synchronous failures into
+     * a failed future.
+     *
+     * If the supplier itself is {@code null}, the returned future is completed exceptionally with a
+     * {@link NullPointerException}.
+     *
+     * @param supplier the supplier to invoke
+     * @param <T> the result type of the returned future
+     * @return the future returned by the supplier, or a failed future if the supplier throws or returns {@code null}
+     */
     public static <T> CompletableFuture<T> supplySafely(Supplier<CompletableFuture<T>> supplier) {
         CompletableFuture<T> future;
         try {
@@ -251,13 +262,11 @@ public class FutureUtil {
                 if (sequencerFuture.isCompletedExceptionally() && allowExceptionBreakChain) {
                     return sequencerFuture;
                 }
-                return sequencerFuture = getFutureSafely(newTask, "Expected Supplier should not return null");
+                return sequencerFuture = supplySafely(newTask);
             }
             return sequencerFuture = allowExceptionBreakChain
-                    ? sequencerFuture.thenCompose(__ -> getFutureSafely(newTask,
-                            "Expected Supplier should not return null"))
-                    : sequencerFuture.exceptionally(ex -> null).thenCompose(__ -> getFutureSafely(newTask,
-                            "Expected Supplier should not return null"));
+                    ? sequencerFuture.thenCompose(__ -> supplySafely(newTask))
+                    : sequencerFuture.exceptionally(ex -> null).thenCompose(__ -> supplySafely(newTask));
         }
     }
 
@@ -314,8 +323,7 @@ public class FutureUtil {
         final CompletableFuture<T> future = new CompletableFuture<>();
         try {
             executor.execute(() -> {
-                CompletableFuture<T> supplierFuture =
-                        getFutureSafely(futureSupplier, "Expected Supplier should not return null");
+                CompletableFuture<T> supplierFuture = supplySafely(futureSupplier);
                 supplierFuture.whenComplete((result, error) -> {
                     if (error != null) {
                         future.completeExceptionally(error);
