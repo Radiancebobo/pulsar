@@ -21,6 +21,7 @@ package org.apache.pulsar.common.util;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertSame;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 import java.io.PrintWriter;
@@ -268,6 +269,55 @@ public class FutureUtilTest {
         } catch (ExecutionException e) {
             assertTrue(e.getCause() instanceof IllegalStateException);
             assertEquals(e.getCause().getMessage(), "sync fail");
+        }
+    }
+
+    @Test
+    public void testSupplySafelyReturnsSupplierFuture() throws Exception {
+        CompletableFuture<String> expected = CompletableFuture.completedFuture("ok");
+        CompletableFuture<String> future = FutureUtil.supplySafely(() -> expected);
+
+        assertSame(future, expected);
+        assertEquals(future.get(2, TimeUnit.SECONDS), "ok");
+    }
+
+    @Test
+    public void testSupplySafelyReturnsFailedFutureWhenSupplierIsNull() throws Exception {
+        CompletableFuture<String> future = FutureUtil.supplySafely(null);
+
+        try {
+            future.get(2, TimeUnit.SECONDS);
+            fail("Should have failed.");
+        } catch (ExecutionException e) {
+            assertTrue(e.getCause() instanceof NullPointerException);
+        }
+    }
+
+    @Test
+    public void testSupplySafelyReturnsFailedFutureWhenSupplierThrowsSynchronously() throws Exception {
+        RuntimeException expected = new IllegalStateException("sync fail");
+
+        CompletableFuture<String> future = FutureUtil.supplySafely(() -> {
+            throw expected;
+        });
+
+        try {
+            future.get(2, TimeUnit.SECONDS);
+            fail("Should have failed.");
+        } catch (ExecutionException e) {
+            assertEquals(e.getCause(), expected);
+        }
+    }
+
+    @Test
+    public void testSupplySafelyReturnsFailedFutureWhenSupplierReturnsNull() throws Exception {
+        CompletableFuture<String> future = FutureUtil.supplySafely(() -> null);
+
+        try {
+            future.get(2, TimeUnit.SECONDS);
+            fail("Should have failed.");
+        } catch (ExecutionException e) {
+            assertTrue(e.getCause() instanceof NullPointerException);
         }
     }
 

@@ -75,16 +75,7 @@ public class Futures {
                                                             Class<? extends Exception> needRetryExceptionClass,
                                                             int maxRetryTimes) {
         CompletableFuture<T> resultFuture = new CompletableFuture<>();
-        CompletableFuture<T> opFuture;
-        try {
-            opFuture = op.get();
-        } catch (Throwable ex) {
-            opFuture = FutureUtil.failedFuture(ex);
-        }
-        if (opFuture == null) {
-            opFuture = FutureUtil.failedFuture(new NullPointerException("Retry operation returned null future"));
-        }
-        opFuture.whenComplete((res, ex) -> {
+        FutureUtil.supplySafely(op).whenComplete((res, ex) -> {
             if (ex == null) {
                 resultFuture.complete(res);
             } else {

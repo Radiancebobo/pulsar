@@ -204,14 +204,15 @@ public class FutureUtil {
      * Invokes a supplier that is expected to return a {@link CompletableFuture}, converting synchronous failures into
      * a failed future.
      *
-     * If the supplier itself is {@code null}, the returned future is completed exceptionally with a
-     * {@link NullPointerException}.
-     *
      * @param supplier the supplier to invoke
      * @param <T> the result type of the returned future
-     * @return the future returned by the supplier, or a failed future if the supplier throws or returns {@code null}
+     * @return the future returned by the supplier, or a failed future if the supplier is {@code null}, throws,
+     *         or returns {@code null}
      */
     public static <T> CompletableFuture<T> supplySafely(Supplier<CompletableFuture<T>> supplier) {
+        if (supplier == null) {
+            return failedFuture(new NullPointerException("Expected Supplier should not be null"));
+        }
         CompletableFuture<T> future;
         try {
             future = supplier.get();
@@ -251,8 +252,9 @@ public class FutureUtil {
         }
 
         /**
-         * @return a {@link CompletableFuture} representing the newly scheduled task,
-         * or one completed exceptionally with {@link NullPointerException} if param is null.
+         * @return a {@link CompletableFuture} representing the newly scheduled task, or the current failed chain when
+         * exceptions are allowed to break the chain. Returns a failed future if the supplier is {@code null}, throws,
+         * or returns {@code null}.
          */
         public synchronized CompletableFuture<T> sequential(Supplier<CompletableFuture<T>> newTask) {
             if (newTask == null) {
@@ -309,8 +311,8 @@ public class FutureUtil {
 
     /**
      * @return a {@link CompletableFuture} representing the asynchronous composition.
-     * The returned future is completed exceptionally with {@link NullPointerException} if one of params is null,
-     * or with {@link RejectedExecutionException} if the task cannot be accepted for execution.
+     * The returned future is completed exceptionally if one of the params is {@code null}, if the supplier throws or
+     * returns {@code null}, or if the executor rejects the task.
      */
     public static <T> @NonNull CompletableFuture<T> composeAsync(Supplier<CompletableFuture<T>> futureSupplier,
                                                                  Executor executor) {
@@ -323,8 +325,7 @@ public class FutureUtil {
         final CompletableFuture<T> future = new CompletableFuture<>();
         try {
             executor.execute(() -> {
-                CompletableFuture<T> supplierFuture = supplySafely(futureSupplier);
-                supplierFuture.whenComplete((result, error) -> {
+                supplySafely(futureSupplier).whenComplete((result, error) -> {
                     if (error != null) {
                         future.completeExceptionally(error);
                         return;
